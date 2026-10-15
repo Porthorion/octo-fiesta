@@ -300,9 +300,46 @@ public class DeezerDownloadServiceTests : IDisposable
     [InlineData(true)]
     public async Task DownloadSongAsync_WritesDecryptedAudio(bool useAlternativeTrack)
     {
-        // An alternative track's media is encrypted with its own id, not the requested one
         var plain = DeezerDecryptedStreamTests.RandomAudio(5_000_000);
+        SetupDownload(plain, useAlternativeTrack);
+
+        var path = await CreateService(arl: "test-arl").DownloadSongAsync("deezer", "123");
+
+        Assert.Equal(".flac", Path.GetExtension(path));
+        Assert.Equal(plain, await File.ReadAllBytesAsync(path));
+    }
+
+    [Fact]
+    public async Task DownloadSongAsync_WhenApiQuotaIsExceeded_RetriesTheTrackLookup()
+    {
+        var plain = DeezerDecryptedStreamTests.RandomAudio(100_000);
+        SetupDownload(plain, trackErrors: "{\"error\":{\"type\":\"Exception\",\"message\":\"Quota limit exceeded\",\"code\":4}}");
+
+        var path = await CreateService(arl: "test-arl").DownloadSongAsync("deezer", "123");
+
+        Assert.Equal(plain, await File.ReadAllBytesAsync(path));
+    }
+
+    [Fact]
+    public async Task DownloadSongAsync_WhenApiReturnsError_ReportsIt()
+    {
+        SetupDownload(DeezerDecryptedStreamTests.RandomAudio(100_000),
+            trackErrors: "{\"error\":{\"type\":\"DataException\",\"message\":\"no data\",\"code\":800}}");
+
+        var ex = await Assert.ThrowsAsync<Exception>(() => CreateService(arl: "test-arl").DownloadSongAsync("deezer", "123"));
+
+        Assert.Equal("Deezer API error for track 123: no data", ex.Message);
+    }
+
+    /// <summary>
+    /// Mocks every Deezer call of a download of track 123. The media is encrypted with the id of
+    /// the track it belongs to, so using the alternative track 456 needs its own key.
+    /// <paramref name="trackErrors"/> are served by the public API before the track itself.
+    /// </summary>
+    private void SetupDownload(byte[] plain, bool useAlternativeTrack = false, params string[] trackErrors)
+    {
         var encrypted = DeezerDecryptedStreamTests.Encrypt(plain, useAlternativeTrack ? "456" : "123");
+        var pendingErrors = new Queue<string>(trackErrors);
         var mediaRequests = 0;
 
         _httpMessageHandlerMock.Protected()
@@ -318,7 +355,9 @@ public class DeezerDownloadServiceTests : IDisposable
                 }
                 else if (url.EndsWith("/track/123") || url.EndsWith("/track/456"))
                 {
-                    content = new StringContent("{\"title\":\"S\",\"artist\":{\"name\":\"A\"},\"readable\":true,\"track_token\":\"tok\"}");
+                    content = new StringContent(pendingErrors.Count > 0
+                        ? pendingErrors.Dequeue()
+                        : "{\"title\":\"S\",\"artist\":{\"name\":\"A\"},\"readable\":true,\"track_token\":\"tok\"}");
                 }
                 else if (url.Contains("pageTrack"))
                 {
@@ -349,12 +388,5 @@ public class DeezerDownloadServiceTests : IDisposable
         _localLibraryServiceMock
             .Setup(s => s.GetMappingForExternalSongAsync("deezer", "123"))
             .ReturnsAsync((LocalSongMapping?)null);
-
-        var service = CreateService(arl: "test-arl");
-
-        var path = await service.DownloadSongAsync("deezer", "123");
-
-        Assert.Equal(".flac", Path.GetExtension(path));
-        Assert.Equal(plain, await File.ReadAllBytesAsync(path));
     }
 }

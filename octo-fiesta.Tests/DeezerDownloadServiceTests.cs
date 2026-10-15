@@ -294,4 +294,67 @@ public class DeezerDownloadServiceTests : IDisposable
         var ex = await Assert.ThrowsAnyAsync<Exception>(() => downloadTask);
         Assert.Contains("No media sources", ex.Message);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DownloadSongAsync_WritesDecryptedAudio(bool useAlternativeTrack)
+    {
+        // An alternative track's media is encrypted with its own id, not the requested one
+        var plain = DeezerDecryptedStreamTests.RandomAudio(5_000_000);
+        var encrypted = DeezerDecryptedStreamTests.Encrypt(plain, useAlternativeTrack ? "456" : "123");
+        var mediaRequests = 0;
+
+        _httpMessageHandlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .Returns<HttpRequestMessage, CancellationToken>((req, _) =>
+            {
+                var url = req.RequestUri!.ToString();
+                HttpContent content;
+
+                if (url.Contains("deezer.getUserData"))
+                {
+                    content = new StringContent("{\"results\":{\"checkForm\":\"form\",\"USER\":{\"OPTIONS\":{\"license_token\":\"lic\"}}}}");
+                }
+                else if (url.EndsWith("/track/123") || url.EndsWith("/track/456"))
+                {
+                    content = new StringContent("{\"title\":\"S\",\"artist\":{\"name\":\"A\"},\"readable\":true,\"track_token\":\"tok\"}");
+                }
+                else if (url.Contains("pageTrack"))
+                {
+                    content = new StringContent("{\"results\":{\"DATA\":{\"FALLBACK\":{\"SNG_ID\":\"456\"},\"TRACK_TOKEN\":\"pt\"}}}");
+                }
+                else if (url.Contains("get_url"))
+                {
+                    var hasMedia = !useAlternativeTrack || mediaRequests++ > 0;
+                    content = new StringContent(hasMedia
+                        ? "{\"data\":[{\"media\":[{\"format\":\"FLAC\",\"sources\":[{\"url\":\"https://cdn.test/media\"}]}]}]}"
+                        : "{\"data\":[{}]}");
+                }
+                else if (url == "https://cdn.test/media")
+                {
+                    content = new StreamContent(new DeezerDecryptedStreamTests.TrickleStream(encrypted));
+                }
+                else
+                {
+                    throw new InvalidOperationException($"Unexpected URL in mock: {url}");
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+            });
+
+        _metadataServiceMock
+            .Setup(s => s.GetSongAsync("deezer", "123"))
+            .ReturnsAsync(new Song { ExternalId = "123", ExternalProvider = "deezer", Title = "T", Artist = "A", Album = "B" });
+        _localLibraryServiceMock
+            .Setup(s => s.GetMappingForExternalSongAsync("deezer", "123"))
+            .ReturnsAsync((LocalSongMapping?)null);
+
+        var service = CreateService(arl: "test-arl");
+
+        var path = await service.DownloadSongAsync("deezer", "123");
+
+        Assert.Equal(".flac", Path.GetExtension(path));
+        Assert.Equal(plain, await File.ReadAllBytesAsync(path));
+    }
 }
